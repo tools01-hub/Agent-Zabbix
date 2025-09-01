@@ -304,13 +304,28 @@ list_plugins_apt() {
 }
 list_plugins_dnf() {
   if command -v dnf >/dev/null 2>&1; then
+    # EL8+ (dnf disponível)
     dnf -y install dnf-plugins-core >/dev/null 2>&1 || true
     dnf repoquery --qf '%{name}' --available 'zabbix-agent2-plugin-*' 2>/dev/null \
-      | grep '^zabbix-agent2-plugin-' \
+      | awk 'NF && $1 ~ /^zabbix-agent2-plugin-/ {print $1}' \
       | sort -u || true
   else
-    yum list available 'zabbix-agent2-plugin-*' 2>/dev/null \
-      | awk '/^zabbix-agent2-plugin-/{print $1}' | sort -u || true
+    # EL7 (sem dnf): preferir repoquery do yum-utils
+    if ! command -v repoquery >/dev/null 2>&1; then
+      yum -y install yum-utils >/dev/null 2>&1 || true
+    fi
+
+    if command -v repoquery >/dev/null 2>&1; then
+      repoquery --qf '%{name}' --available 'zabbix-agent2-plugin-*' 2>/dev/null \
+        | awk 'NF && $1 ~ /^zabbix-agent2-plugin-/ {print $1}' \
+        | sort -u || true
+    else
+      # Fallback: parse do 'yum list available' e remover o sufixo .arch
+      yum list available 'zabbix-agent2-plugin-*' 2>/dev/null \
+        | awk '/^zabbix-agent2-plugin-/ {print $1}' \
+        | awk -F. '{print $1}' \
+        | sort -u || true
+    fi
   fi
 }
 
@@ -344,9 +359,11 @@ install_rhel_family() {
   if [[ "${VERSION,,}" == *"stream"* ]] || [[ "${PRETTY_NAME,,}" == *"stream"* ]]; then
     echo "Aviso: detectado *Stream*; tentando usar EL${VERSION_ID_MAJOR}."
   fi
+
   local ver_major="$VERSION_ID_MAJOR"
   local archdir="$ARCH_NORM"   # x86_64 | aarch64 | ppc64le | s390x
   local url="https://repo.zabbix.com/zabbix/7.0/rhel/${ver_major}/${archdir}/zabbix-release-latest-7.0.el${ver_major}.noarch.rpm"
+
   echo "Instalando repositório Zabbix para EL${ver_major} (${archdir})"
   url_ok "$url" || { echo "ERRO: pacote de release indisponível: $url"; exit 1; }
   local tmp="/tmp/zabbix-release.rpm"
@@ -354,67 +371,89 @@ install_rhel_family() {
   rpm -Uvh "$tmp"
   rm -f "$tmp"
 
-  dnf clean all -y || true
-  dnf makecache -y
+  # ---------- Escolhe DNF ou YUM ----------
+  if command -v dnf >/dev/null 2>&1; then
+    # ----------- CAMINHO DNF (EL8+) -----------
+    dnf clean all -y || true
+    dnf makecache -y || true
+    dnf repolist zabbix\* || true
 
-  # (Opcional) mostra os repos zabbix habilitados para debug
-  dnf repolist zabbix\* || true
+    mapfile -t plugins < <(list_plugins_dnf || true)
 
-  # Lista plugins disponíveis (se falhar, seguimos só com o agente)
-  mapfile -t plugins < <(list_plugins_dnf || true)
-
-  echo "Instalando zabbix-agent2${plugins:+ + plugins (${#plugins[@]})}..."
-  use_fallback=0
-  if ((${#plugins[@]})); then
-    if ! dnf install -y zabbix-agent2 "${plugins[@]}"; then
-      use_fallback=1
-    fi
-  else
-    if ! dnf install -y zabbix-agent2; then
-      use_fallback=1
-    fi
-  fi
-
-  if (( use_fallback )); then
-    echo "Instalação via dnf falhou. Iniciando FALLBACK por URL…"
-
-    # limpa diretório de fallback
-    rm -rf "$fallback_dir" && mkdir -p "$fallback_dir"
-
-    # agente: só a última URL
-    mapfile -t agent_urls  < <(dnf repoquery --latest-limit 1 --location zabbix-agent2 2>/dev/null | grep -E '^https?://')
-
-    # plugins: só a última URL de cada plugin (uma por pacote)
+    echo "Instalando zabbix-agent2${plugins:+ + plugins (${#plugins[@]})}..."
+    use_fallback=0
     if ((${#plugins[@]})); then
-      mapfile -t plugin_urls < <(for p in "${plugins[@]}"; do dnf repoquery --latest-limit 1 --location "$p" 2>/dev/null | grep -E '^https?://'; done)
+      dnf install -y zabbix-agent2 "${plugins[@]}" || use_fallback=1
     else
-      plugin_urls=()
+      dnf install -y zabbix-agent2 || use_fallback=1
     fi
 
-    if ((${#agent_urls[@]}==0)); then
-      echo "ERRO: não consegui resolver a URL do pacote zabbix-agent2 via repoquery."
-      exit 1
+    if (( use_fallback )); then
+      echo "Instalação via dnf falhou. Iniciando FALLBACK por URL…"
+      rm -rf "$fallback_dir" && mkdir -p "$fallback_dir"
+
+      mapfile -t agent_urls  < <(dnf repoquery --latest-limit 1 --location zabbix-agent2 2>/dev/null | grep -E '^https?://')
+      if ((${#plugins[@]})); then
+        mapfile -t plugin_urls < <(for p in "${plugins[@]}"; do dnf repoquery --latest-limit 1 --location "$p" 2>/dev/null | grep -E '^https?://'; done)
+      else
+        plugin_urls=()
+      fi
+      if ((${#agent_urls[@]}==0)); then
+        echo "ERRO: não consegui resolver a URL do pacote zabbix-agent2 via repoquery."
+        exit 1
+      fi
+      for u in "${agent_urls[@]}" "${plugin_urls[@]}"; do
+        [[ -n "$u" ]] || continue
+        fallback_download "$u" "$fallback_dir/$(basename "$u")"
+      done
+      rpm -Uvh --replacepkgs --replacefiles "$fallback_dir"/*.rpm
     fi
 
-    # Baixa tudo (pula linhas vazias/ruído)
-    for u in "${agent_urls[@]}" "${plugin_urls[@]}"; do
-      [[ -n "$u" ]] || continue
-      base="$(basename "$u")"
-      fallback_download "$u" "$fallback_dir/$base"
-    done
+  else
+    # ----------- CAMINHO YUM (EL7) -----------
+    yum clean all -y || true
+    yum makecache -y || yum makecache fast || true
+    yum repolist zabbix\* || true
 
-    echo "Instalando RPMs baixados (fallback)…"
-    shopt -s nullglob
-    rpms=( "$fallback_dir"/*.rpm )
-    if ((${#rpms[@]}==0)); then
-      echo "ERRO: nenhum RPM foi baixado no fallback."
-      exit 1
+    # repoquery vem do yum-utils
+    if ! command -v repoquery >/dev/null 2>&1; then
+      yum -y install yum-utils >/dev/null 2>&1 || true
     fi
-    rpm -Uvh --replacepkgs --replacefiles "${rpms[@]}"
-    shopt -u nullglob
+
+    mapfile -t plugins < <(list_plugins_dnf || true)
+
+    echo "Instalando zabbix-agent2${plugins:+ + plugins (${#plugins[@]})}..."
+    use_fallback=0
+    if ((${#plugins[@]})); then
+      yum install -y zabbix-agent2 "${plugins[@]}" || use_fallback=1
+    else
+      yum install -y zabbix-agent2 || use_fallback=1
+    fi
+
+    if (( use_fallback )); then
+      echo "Instalação via yum falhou. Iniciando FALLBACK por URL…"
+      rm -rf "$fallback_dir" && mkdir -p "$fallback_dir"
+
+      # Usa repoquery (yum-utils) para pegar URLs diretas
+      mapfile -t agent_urls  < <(repoquery --location --latest-limit=1 zabbix-agent2 2>/dev/null | grep -E '^https?://')
+      if ((${#plugins[@]})); then
+        mapfile -t plugin_urls < <(for p in "${plugins[@]}"; do repoquery --location --latest-limit=1 "$p" 2>/dev/null | grep -E '^https?://'; done)
+      else
+        plugin_urls=()
+      fi
+      if ((${#agent_urls[@]}==0)); then
+        echo "ERRO: não consegui resolver a URL do pacote zabbix-agent2 via repoquery (yum-utils)."
+        exit 1
+      fi
+      for u in "${agent_urls[@]}" "${plugin_urls[@]}"; do
+        [[ -n "$u" ]] || continue
+        fallback_download "$u" "$fallback_dir/$(basename "$u")"
+      done
+      rpm -Uvh --replacepkgs --replacefiles "$fallback_dir"/*.rpm
+    fi
   fi
 
-  # Valida instalação
+  # ---------- Validação final ----------
   if ! rpm -q zabbix-agent2 >/dev/null 2>&1; then
     echo "ERRO: zabbix-agent2 não foi instalado. Verifique acesso ao repositório e dependências."
     exit 1
